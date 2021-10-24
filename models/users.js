@@ -2,22 +2,24 @@ const mongoose=require('mongoose')
 
 const userSchema=new mongoose.Schema({
  
-    username:{
+    first_name:{
         type:String,
         required:true,
-        unique:true
     },
     contact:{
         type:String,
         required:true,
         unique:true
     },
+    email:{
+        type:String,
+        required:true,
+        unique:true
+    },
    
-    password: {
+    last_name: {
         type: String,
-        min: 6,
         required: true,
-        trim:true
     },
     avatar:{
         type:String
@@ -25,13 +27,6 @@ const userSchema=new mongoose.Schema({
     cloudinary_id:{
         type:String
     },
-    role:{
-        type: String,
-        required: true,
-        default:"CLIENT",
-        enum:['CLIENT','MENTOR','ADMIN']
-    },
-   
     
 },{timestamps:true})
 

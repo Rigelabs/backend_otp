@@ -12,27 +12,23 @@ const logger = require("../middlewares/logger");
 const generalrateLimiterMiddleware = require("../middlewares/rateLimiters/genericLimiter");
 const jwt = require('jsonwebtoken');
 const { RateLimiterRedis } = require('rate-limiter-flexible');
+const sendOTP = require("../middlewares/aws_sns");
 
 const router = express.Router();
 
 env.config();
 
 const schema = Joi.object({
-
-    username: Joi.string().required().alphanum().max(10),
     email: Joi.string().required().email({ minDomainSegments: 2, tlds: { allow: ['com', 'net'] } }),
-    password: Joi.string().required().regex(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{3,10}$/).
-        error(new Error('Password requirement: Minimum 3 and maximum 10 characters, at least one uppercase letter,one lowercase letter, one number')),
-    confirmPassword: Joi.any().equal(Joi.ref('password')).required().
-        messages({ 'any.only': 'passwords does not match' }),
-    contact: Joi.string().max(14).min(13).error(new Error('Invalid Phone number')),
-
+    first_name: Joi.string().required().max(20).min(3).regex(/^[A-Za-z]+$/).error(new Error("Invalid First Name")),
+    last_name: Joi.string().required().max(20).min(3).regex(/^[A-Za-z]+$/).error(new Error("Invalid Last Name")),
+    location:Joi.string().required(),
+    contact: Joi.string().trim().regex(/^[0-9]{12,13}$/).error(new Error('Invalid Phone number')),
     avatar: Joi.string()
 });
 const loginschema = Joi.object({
-
     contact: Joi.string().required(),
-    password: Joi.string().required()
+    
 });
 
 const nanoid = customAlphabet('1234567890abcdef', 6)
@@ -66,42 +62,38 @@ router.post('/users/create', uploads.single("avatar"), async (req, res) => {
             return res.status(400).json({ message: "Email already exist" });
         }
 
-        //check if username already exist in database
-
-        const usernameexist = await Users.findOne({ username: req.body.username });
-        if (usernameexist) {
-          return  res.status(400).json({ message: "Username already exist" })
-        }
         //check if contact already exist in database
 
         const contactexist = await Users.findOne({ contact: req.body.contact });
         if (contactexist) {
            return res.status(400).json({ message: `Contact ${req.body.contact} already exist` })
         }
-        //Hash the password
-
-        const salt = await bcrypt.genSalt(10);
-        var hashedPassword = await bcrypt.hash(req.body.password, salt);
 
         //uploading image to cloudinary
 
         const file = req.file
 
-        const result = await cloudinary.uploader.upload(file.path);
+        let result
+        if(file){
+           result= await cloudinary.uploader.upload(file.path)
+        };
         //create new user object after validation and hashing
 
         const user = new Users({
             email: req.body.email,
-            username: req.body.username,
-            password: hashedPassword,
+            first_name: req.body.first_name,
+            last_name: req.body.last_name,
             contact: req.body.contact,
-            avatar: result.secure_url,
-            cloudinary_id: result.public_id
+            avatar: result ? result.secure_url : null,
+            cloudinary_id: result ? result.public_id : null
         });
         //try to save user 
 
         await user.save()
-        return res.status(200).json({ message: "Account registered successfully, we are responding through the contact with more information" });
+        sendOTP(req.body.contact).then(result=>{
+            return res.status(200).json({ message: "Account registered successfully, Please proceed to Login" });
+        })
+        
 
 
 
@@ -138,57 +130,82 @@ router.post('/user/login', async (req, res) => {
             if (!user) {
                 res.status(400).json({ message: "Account doesn't not exist" })
             } else {
-                //check if role is Admin
-
-
-                //check if password match
-
-                const validpass = await bcrypt.compare(req.body.password, user.password);
-                if (!validpass) {
-
-                    // Consume 1 point for each failed login attempt
-                    rateLimiter.consume(req.socket.remoteAddress)
-                        .then((data) => {
-                            // Message to user
-                           return res.status(400).json({message:`Invalid Credentials, you have ${data.remainingPoints}  attempts left`});
-                        })
-                        .catch((rejRes) => {
-                            // Blocked
-                            const secBeforeNext = Math.ceil(rejRes.msBeforeNext / 60000) || 1;
-                            logger.error(`LoggingIn alert: Contact: ${req.body.contact} on IP: ${req.socket.remoteAddress} is Chocking Me !!`)
-                           return res.status(429).send(`Too Many Requests, Retry-After ${String(secBeforeNext)} Minutes`);
-                        });
-                   
-                }else{
-
-                //create and assign a token once logged in
-
-                const token = jwt.sign({ _id: user._id, role: user.role }, process.env.TOKEN_SECRET, { expiresIn: 120 })
-
-
-                const refreshToken = jwt.sign({ _id: user._id,role: user.role }, process.env.REFRESH_TOKEN_SECRET,
-                    { expiresIn: '1d' });
-
-                await redisClient.set(user._id.toString(), JSON.stringify({ refreshToken: refreshToken }));
-                 
-                const userInfo = {
-                    _id: user._id,
-                    role: user.role,
-                    username: user.role,
-                    contact: user.contact,
-                    avatar: user.avatar
-                }
-                res.header('token', token).json({ 'token': token, 'refreshToken': refreshToken, 'user': userInfo });
+                //send otp and save in the redis db
+                sendOTP(user.contact).then(result=>{
+                    res.status(200).json({ message: "Account verified, submit the OTP code to login" })
+                })
+               
 
             }
-
-            }
-
         }
     } catch (error) {
         res.status(400).json({ message: error.message })
     }
 })
+//verify otpcode and assign jwt
+router.post("/user/otpverify", async (req,res)=>{
+    const otpCode = req.body.otp_code
+    const contact = req.body.contact
+    try {
+        if(otpCode){
+            const user = await Users.findOne({ contact: contact });
+    
+                if (!user) {
+                    res.status(400).json({ message: "Account doesn't not exist" })
+                } else {
+            //compare code in redis with the ones sent
+             await redisClient.get(contact.toString(),(err,redisData)=>{
+                if(err){ return logger.error(err)};
+                           console.log(redisData)
+                if(redisData ===null || JSON.parse(redisData).redisCode != otpCode ) {
+                 // Consume 1 point for each failed login attempt
+                 rateLimiter.consume(req.socket.remoteAddress)
+                 .then((data) => {
+                     // Message to user
+                    return res.status(400).json({message:`Invalid Code, you have ${data.remainingPoints} attempts left, Please Login Again`});
+                 })
+                 .catch((rejRes) => {
+                     // Blocked
+                     const secBeforeNext = Math.ceil(rejRes.msBeforeNext / 60000) || 1;
+                     logger.error(`LoggingIn alert: Contact: ${req.body.contact} on IP: ${req.socket.remoteAddress} is Chocking Me !!`)
+                    return res.status(429).send(`Too Many Requests, Try to Login After ${String(secBeforeNext)} Minutes`);
+                 });
+            
+                
+                }else{
+    
+                    //create and assign a token once code is verified
+    
+                    const token = jwt.sign({ _id: user._id, role: user.role }, process.env.TOKEN_SECRET, { expiresIn: 120 })
+    
+    
+                    const refreshToken = jwt.sign({ _id: user._id,role: user.role }, process.env.REFRESH_TOKEN_SECRET,
+                        { expiresIn: '1d' });
+    
+                     redisClient.set(user._id.toString(), JSON.stringify({ refreshToken: refreshToken }));
+                     
+                    const userInfo = {
+                        _id: user._id,
+                        first_name: user.first_name,
+                        last_name: user.last_name,
+                        contact: user.contact,
+                        avatar: user.avatar
+                    }
+                    res.header('token', token).json({ 'token': token, 'refreshToken': refreshToken, 'user': userInfo });
+             }
+            })
+                
+        }}else{
+            return res.status(400).json({ message: "Invalid request, Login again to get another code" })
+        }
+    } catch (error) {
+       return res.status(400).json({ message: error.message})
+    }
+    
+        
+   
+})
+
 //Deleting a Cleint
 router.delete("/user/delete/:id", ensureAuth, async (req, res) => {
     try {
